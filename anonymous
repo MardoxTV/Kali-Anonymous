@@ -3,8 +3,7 @@
 #
 # Updated for modern Kali Linux (systemd, iproute2, systemd-resolved)
 # Original Author: Raffaele Forte <raffaele@backbox.org>
-# Originally perfected for Kali by keeganjk
-# Updated for modern Kali by MTV / Claude
+# Updated for modern Kali by MTV
 # Version: 2.1
 
 # List, separated by spaces, of destinations you do NOT want routed through Tor
