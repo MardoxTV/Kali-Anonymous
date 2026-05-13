@@ -4,7 +4,7 @@
 # Updated for modern Kali Linux (systemd, iproute2, systemd-resolved)
 # Author: MardoxTV
 # Maintained by: MardoxTV
-# Version: 2.5
+# Version: 2.6
 
 # List, separated by spaces, of destinations you do NOT want routed through Tor
 NON_TOR="192.168.0.0/16 172.16.0.0/12"
@@ -97,13 +97,61 @@ nm_stop() {
     fi
 }
 
-nm_start() {
+# Wait for NetworkManager to be fully active and interfaces online
+nm_start_wait() {
     NM=$(nm_service)
-    if [ -n "$NM" ]; then
-        systemctl start "$NM" 2>/dev/null && printf " * Started %s\n" "$NM" || printf " * Failed to start %s\n" "$NM"
-    else
+    if [ -z "$NM" ]; then
         printf " * NetworkManager not found, skipping\n"
+        return 1
     fi
+    
+    printf " * Starting %s" "$NM"
+    
+    # Start the service
+    systemctl start "$NM" 2>/dev/null
+    if [ $? -ne 0 ]; then
+        printf " (failed to start)\n"
+        return 1
+    fi
+    
+    # Wait for service to be active
+    COUNTER=0
+    MAX_WAIT=20
+    while [ $COUNTER -lt $MAX_WAIT ]; do
+        if systemctl is-active --quiet "$NM"; then
+            printf " (started)"
+            break
+        fi
+        printf "."
+        sleep 1
+        COUNTER=$((COUNTER + 1))
+    done
+    
+    if [ $COUNTER -ge $MAX_WAIT ]; then
+        printf " (timeout - may not be running)\n"
+        return 1
+    fi
+    
+    # Now wait for interfaces to come up with IP addresses
+    printf " (waiting for network)"
+    COUNTER=0
+    MAX_WAIT=30
+    while [ $COUNTER -lt $MAX_WAIT ]; do
+        # Check if any interface has an IP address (not 127.0.0.1)
+        if ip addr show | grep -E "inet [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | grep -v "127.0.0.1" >/dev/null 2>&1; then
+            IP=$(ip addr show | grep -E "inet [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | grep -v "127.0.0.1" | awk '{print $2}' | cut -d'/' -f1 | head -1)
+            IFACE=$(ip addr show | grep -B5 "$IP" | grep "^[0-9]:" | awk '{print $2}' | sed 's/:$//' | head -1)
+            printf " (online: %s on %s)\n" "$IP" "$IFACE"
+            return 0
+        fi
+        printf "."
+        sleep 1
+        COUNTER=$((COUNTER + 1))
+    done
+    
+    printf " (no IP assigned yet)\n"
+    printf "[!] Warning: Network may not be fully ready\n"
+    return 1
 }
 
 # Kill processes at startup
@@ -224,7 +272,7 @@ wait_for_tor() {
     return 1
 }
 
-# Configure and verify DNS
+# Configure DNS to use Tor
 configure_dns() {
     printf " * Configuring DNS"
     
@@ -264,49 +312,6 @@ DNSEOF
     done
     
     printf " (not responding yet, continuing)\n"
-    return 1
-}
-
-# Check and configure network
-configure_network() {
-    printf " * Configuring network interfaces"
-    
-    # Get all non-loopback interfaces
-    INTERFACES=$(ip link show | grep "UP" | grep -v "LOOPBACK" | awk -F': ' '{print $2}' | sed 's/:$//')
-    
-    if [ -z "$INTERFACES" ]; then
-        INTERFACES=$(ip link show | grep -E "^\d+:" | grep -v "LOOPBACK" | awk -F': ' '{print $2}')
-    fi
-    
-    if [ -z "$INTERFACES" ]; then
-        printf " (no interfaces found)\n"
-        return 1
-    fi
-    
-    # Bring up all interfaces and renew DHCP
-    for IFACE in $INTERFACES; do
-        printf "."
-        ip link set "$IFACE" up 2>/dev/null
-        sleep 0.5
-    done
-    
-    # Renew DHCP leases
-    for IFACE in $INTERFACES; do
-        dhclient "$IFACE" 2>/dev/null &
-    done
-    
-    sleep 3
-    
-    # Verify at least one interface is up
-    ACTIVE=$(ip addr show | grep "inet " | grep -v "127.0.0.1" | awk '{print $NF}' | head -1)
-    
-    if [ -n "$ACTIVE" ]; then
-        IP=$(ip addr show "$ACTIVE" | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
-        printf " (online: %s on %s)\n" "$IP" "$ACTIVE"
-        return 0
-    fi
-    
-    printf " (offline - no IP assigned)\n"
     return 1
 }
 
@@ -407,11 +412,9 @@ do_start() {
         printf "\n"
     fi
 
-    nm_start
-    
-    # Configure and verify network and DNS
-    printf "\n[*] Finalizing configuration...\n"
-    configure_network
+    # Start NetworkManager and wait for network to be ready
+    printf "\n[*] Bringing network online...\n"
+    nm_start_wait
     
     printf "\n"
 }
@@ -472,7 +475,10 @@ do_stop() {
         printf "\n"
     fi
 
-    nm_start
+    # Restart NetworkManager
+    printf "\n[*] Restoring network...\n"
+    nm_start_wait
+
     systemctl restart tor
 
     if [ "$DISPLAY" ]; then
