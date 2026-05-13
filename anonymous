@@ -1,9 +1,9 @@
 #!/bin/sh
-# BackBox Script for Anonymous Internet Navigation
+# Anonymous Internet Navigation Script
 #
 # Updated for modern Kali Linux (systemd, iproute2, systemd-resolved)
-# Original Author: Raffaele Forte <raffaele@backbox.org>
-# Updated for modern Kali by MTV
+# Author: MardoxTV
+# Maintained by: MardoxTV
 # Version: 2.1
 
 # List, separated by spaces, of destinations you do NOT want routed through Tor
@@ -257,7 +257,7 @@ do_start() {
     warning
 
     printf "\n[i] Starting anonymous mode\n"
-    printf "Report bugs to https://github.com/keeganjk/kali-anonymous/issues\n\n"
+    printf "Report bugs to https://github.com/MardoxTV/Kali-Anonymous/issues\n\n"
 
     nm_stop
 
@@ -370,7 +370,7 @@ do_status() {
 
 do_update() {
     printf "\n[i] Updating...\n\n"
-    git clone https://github.com/keeganjk/kali-anonymous
+    git clone https://github.com/MardoxTV/Kali-Anonymous
     cd kali-anonymous || exit 1
     sh setup.sh
     cd ..

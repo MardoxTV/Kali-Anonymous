@@ -11,7 +11,7 @@
                                                                 |___/   
 ```
 
-The `anonymous` script from ParrotSec and BackBox, updated to run on modern Kali Linux (systemd).
+A script for running on modern Kali Linux (systemd) to enhance anonymity and privacy.
 
 ---
 
@@ -52,8 +52,8 @@ When stopped, it reverses all of the above: restores `iptables` rules, restores 
 Clone the repository and run the setup script:
 
 ```bash
-git clone https://github.com/keeganjk/kali-anonymous
-cd kali-anonymous
+git clone https://github.com/MardoxTV/Kali-Anonymous
+cd Kali-Anonymous
 chmod +x setup.sh
 sudo ./setup.sh
 ```
@@ -169,4 +169,4 @@ GNU Affero General Public License v3.0 — see [LICENSE](LICENSE) for details.
 
 ## Bugs / Issues
 
-Report bugs at: https://github.com/keeganjk/kali-anonymous/issues
+Report bugs at: https://github.com/MardoxTV/Kali-Anonymous/issues
