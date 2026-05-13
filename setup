@@ -7,14 +7,14 @@ printf "\n"
 
 # Must be run as root
 if [ "$(id -u)" -ne 0 ]; then
-    printf "[!] Please run as root: sudo ./setup.sh\n"
+    printf "[!] Please run as root: sudo ./setup\n"
     exit 1
 fi
 
 # Check we're in the right directory
 if [ ! -f "./anonymous" ]; then
     printf "[!] Cannot find the 'anonymous' file in the current directory.\n"
-    printf "    Make sure you run this script from inside the kali-anonymous folder.\n"
+    printf "    Make sure you run this script from inside the Kali-Anonymous folder.\n"
     exit 1
 fi
 
@@ -46,13 +46,60 @@ else
     printf "[+] curl is already installed.\n"
 fi
 
+# Install dhclient if not already installed (needed for DHCP)
+if ! command -v dhclient >/dev/null 2>&1; then
+    printf "[*] dhclient not found. Installing...\n"
+    apt-get install -y isc-dhcp-client || { printf "[!] Failed to install dhclient\n"; exit 1; }
+else
+    printf "[+] dhclient is already installed.\n"
+fi
+
+# Install dnsutils if not already installed (needed for DNS checks)
+if ! command -v nslookup >/dev/null 2>&1; then
+    printf "[*] dnsutils not found. Installing...\n"
+    apt-get install -y dnsutils || { printf "[!] Failed to install dnsutils\n"; exit 1; }
+else
+    printf "[+] dnsutils is already installed.\n"
+fi
+
+# Install net-tools if not already installed (needed for netstat)
+if ! command -v netstat >/dev/null 2>&1; then
+    printf "[*] net-tools not found. Installing...\n"
+    apt-get install -y net-tools || { printf "[!] Failed to install net-tools\n"; exit 1; }
+else
+    printf "[+] net-tools is already installed.\n"
+fi
+
 # Ensure iproute2 is installed
 printf "[*] Ensuring iproute2 is installed...\n"
 apt-get install -y iproute2 || { printf "[!] Failed to install iproute2\n"; exit 1; }
 printf "[+] iproute2 OK.\n\n"
 
+# Check for e2fsprogs (needed for chattr command)
+if ! command -v chattr >/dev/null 2>&1; then
+    printf "[*] e2fsprogs not found. Installing...\n"
+    apt-get install -y e2fsprogs || { printf "[!] Failed to install e2fsprogs\n"; exit 1; }
+else
+    printf "[+] e2fsprogs is already installed.\n"
+fi
+
+# Optionally install NetworkManager
+printf "\n"
+if ! command -v nmcli >/dev/null 2>&1; then
+    printf "[?] NetworkManager not found.\n"
+    printf "    NetworkManager is optional but recommended for better network management.\n"
+    printf "    Install it? (y/n) > "
+    read -r INSTALL_NM
+    case "$INSTALL_NM" in
+        y*|Y*) apt-get install -y network-manager || printf "[!] Failed to install NetworkManager (non-fatal)\n" ;;
+        *) printf "[*] Skipping NetworkManager installation.\n" ;;
+    esac
+else
+    printf "[+] NetworkManager is already installed.\n"
+fi
+
 # Add required Tor config entries (only if not already present)
-printf "[*] Checking Tor configuration...\n"
+printf "\n[*] Checking Tor configuration...\n"
 TORRC="/etc/tor/torrc"
 
 if [ ! -f "$TORRC" ]; then
@@ -86,7 +133,7 @@ if [ -f "./kali-anonymous" ]; then
     printf "[+] Done.\n\n"
 else
     printf "[*] No config file found, creating default at /etc/default/kali-anonymous...\n"
-    cat > /etc/default/kali-anonymous <<'EOF'
+    cat > /etc/default/kali-anonymous <<'CONFIGEOF'
 # kali-anonymous default configuration
 # Edit this file to customise behaviour
 
@@ -110,7 +157,7 @@ OVERWRITE="true"
 
 # Default hostname to restore when stopping
 REAL_HOSTNAME="kali"
-EOF
+CONFIGEOF
     printf "[+] Default config created.\n\n"
 fi
 
