@@ -4,7 +4,7 @@
 # Updated for modern Kali Linux (systemd, iproute2, systemd-resolved)
 # Author: MardoxTV
 # Maintained by: MardoxTV
-# Version: 2.1
+# Version: 2.2
 
 # List, separated by spaces, of destinations you do NOT want routed through Tor
 NON_TOR="192.168.0.0/16 172.16.0.0/12"
@@ -26,6 +26,9 @@ OVERWRITE="true"
 
 # The default local hostname
 REAL_HOSTNAME="kali"
+
+# DNS backup file location
+DNS_BACKUP="/etc/network/resolv.conf.backup"
 
 # Include default options, if any
 if [ -f /etc/default/kali-anonymous ] ; then
@@ -213,6 +216,14 @@ redirect_to_tor() {
         printf " * Saved iptables rules\n"
     fi
 
+    # Backup original resolv.conf before modifying it
+    if [ ! -f "$DNS_BACKUP" ]; then
+        if [ -f /etc/resolv.conf ]; then
+            cp /etc/resolv.conf "$DNS_BACKUP"
+            printf " * Backed up original resolv.conf\n"
+        fi
+    fi
+
     iptables_flush
 
     # Stop systemd-resolved so we can override DNS
@@ -302,12 +313,20 @@ do_stop() {
         printf " * Restored iptables rules\n"
     fi
 
-    # Restore systemd-resolved
-    systemctl start systemd-resolved 2>/dev/null && printf " * Restored systemd-resolved\n"
-    # Restore resolv.conf symlink if it was broken
-    if [ ! -L /etc/resolv.conf ]; then
-        ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
-        printf " * Restored resolv.conf symlink\n"
+    # Restore DNS configuration from backup
+    if [ -f "$DNS_BACKUP" ]; then
+        cp "$DNS_BACKUP" /etc/resolv.conf
+        rm "$DNS_BACKUP"
+        printf " * Restored original DNS configuration\n"
+    else
+        # Fallback: restore systemd-resolved and create symlink
+        systemctl start systemd-resolved 2>/dev/null
+        sleep 1
+        # Remove any existing resolv.conf file
+        rm -f /etc/resolv.conf 2>/dev/null
+        # Create proper symlink to systemd-resolved
+        ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null
+        printf " * Restored systemd-resolved DNS\n"
     fi
 
     kill_process
