@@ -4,7 +4,7 @@
 # Updated for modern Kali Linux (systemd, iproute2, systemd-resolved)
 # Author: MardoxTV
 # Maintained by: MardoxTV
-# Version: 2.2
+# Version: 2.3
 
 # List, separated by spaces, of destinations you do NOT want routed through Tor
 NON_TOR="192.168.0.0/16 172.16.0.0/12"
@@ -201,14 +201,40 @@ iptables_flush() {
     printf " * Deleted all iptables rules\n"
 }
 
+# Wait for Tor to be ready
+wait_for_tor() {
+    printf " * Waiting for Tor to initialize"
+    COUNTER=0
+    MAX_WAIT=30
+    
+    while [ $COUNTER -lt $MAX_WAIT ]; do
+        # Check if Tor is listening on the TransPort
+        if netstat -tuln 2>/dev/null | grep -q ":9040\|:53" || ss -tuln 2>/dev/null | grep -q ":9040\|:53"; then
+            printf " (ready)\n"
+            return 0
+        fi
+        
+        printf "."
+        sleep 1
+        COUNTER=$((COUNTER + 1))
+    done
+    
+    printf " (timeout)\n"
+    printf "[!] Warning: Tor may not be fully initialized\n"
+    return 1
+}
+
 # Transparently route all traffic through Tor
 redirect_to_tor() {
     printf "\n"
 
-    if [ ! -e /var/run/tor/tor.pid ]; then
-        printf "\n[!] Tor is not running! Starting Tor...\n\n"
-        systemctl start tor
-        sleep 2
+    # Ensure Tor is running and start it if needed
+    if ! systemctl is-active --quiet tor; then
+        printf "[*] Starting Tor service...\n"
+        systemctl restart tor
+        wait_for_tor
+    else
+        printf "[*] Tor is already running\n"
     fi
 
     if ! [ -f /etc/network/iptables.rules ]; then
@@ -247,6 +273,8 @@ redirect_to_tor() {
 
     iptables -A OUTPUT -m owner --uid-owner $TOR_UID -j ACCEPT
     iptables -A OUTPUT -j REJECT
+
+    printf " * Tor transparent proxy configured\n"
 }
 
 # BleachBit: delete unnecessary files to preserve privacy
@@ -294,7 +322,6 @@ do_start() {
     fi
 
     nm_start
-    systemctl restart tor
     printf "\n"
 }
 
