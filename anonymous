@@ -4,7 +4,7 @@
 # Updated for modern Kali Linux (systemd, iproute2, systemd-resolved)
 # Author: MardoxTV
 # Maintained by: MardoxTV
-# Version: 2.3
+# Version: 2.4
 
 # List, separated by spaces, of destinations you do NOT want routed through Tor
 NON_TOR="192.168.0.0/16 172.16.0.0/12"
@@ -224,6 +224,50 @@ wait_for_tor() {
     return 1
 }
 
+# Verify DNS is working
+verify_dns() {
+    printf " * Verifying DNS configuration"
+    COUNTER=0
+    MAX_WAIT=10
+    
+    while [ $COUNTER -lt $MAX_WAIT ]; do
+        # Try to resolve a simple DNS query
+        if nslookup google.com 127.0.0.1 2>/dev/null | grep -q "Address" || \
+           dig @127.0.0.1 google.com +short 2>/dev/null | grep -q "[0-9]"; then
+            printf " (working)\n"
+            return 0
+        fi
+        
+        printf "."
+        sleep 1
+        COUNTER=$((COUNTER + 1))
+    done
+    
+    printf " (not responding)\n"
+    printf "[!] Warning: DNS may not be configured correctly\n"
+    return 1
+}
+
+# Check if network is up
+check_network() {
+    printf " * Checking network interfaces"
+    
+    # Check if any interface is up and has an IP
+    INTERFACE=$(ip addr show | grep "UP" | grep -v "LOOPBACK" | awk '{print $2}' | sed 's/:$//' | head -1)
+    
+    if [ -n "$INTERFACE" ]; then
+        IP=$(ip addr show "$INTERFACE" | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
+        if [ -n "$IP" ]; then
+            printf " (online: %s on %s)\n" "$IP" "$INTERFACE"
+            return 0
+        fi
+    fi
+    
+    printf " (offline)\n"
+    printf "[!] Warning: No network interface is up\n"
+    return 1
+}
+
 # Transparently route all traffic through Tor
 redirect_to_tor() {
     printf "\n"
@@ -322,6 +366,12 @@ do_start() {
     fi
 
     nm_start
+    
+    # Verify the setup
+    printf "\n[*] Verifying configuration...\n"
+    check_network
+    verify_dns
+    
     printf "\n"
 }
 
