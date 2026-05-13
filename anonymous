@@ -4,7 +4,7 @@
 # Updated for modern Kali Linux (systemd, iproute2, systemd-resolved)
 # Author: MardoxTV
 # Maintained by: MardoxTV
-# Version: 2.7
+# Version: 2.8
 
 # List, separated by spaces, of destinations you do NOT want routed through Tor
 NON_TOR="192.168.0.0/16 172.16.0.0/12"
@@ -89,14 +89,7 @@ nm_service() {
          [ -f "/lib/systemd/system/network-manager.service" ]; then
         echo "network-manager"
     else
-        # Fallback: try systemctl to see if service is available
-        if systemctl list-unit-files 2>/dev/null | grep -q "NetworkManager.service"; then
-            echo "NetworkManager"
-        elif systemctl list-unit-files 2>/dev/null | grep -q "network-manager.service"; then
-            echo "network-manager"
-        else
-            echo ""
-        fi
+        echo ""
     fi
 }
 
@@ -104,78 +97,55 @@ nm_stop() {
     NM=$(nm_service)
     if [ -n "$NM" ]; then
         systemctl stop "$NM" 2>/dev/null && printf " * Stopped %s\n" "$NM" || printf " * Failed to stop %s\n" "$NM"
-    else
-        printf " * NetworkManager not found, bringing down interfaces manually\n"
-        # Manually bring down all interfaces
-        for iface in $(ip link show | grep -E "^[0-9]+:" | grep -v "LOOPBACK" | awk -F': ' '{print $2}'); do
-            ip link set "$iface" down 2>/dev/null
-        done
     fi
+    
+    # Always bring down interfaces explicitly
+    printf " * Bringing down network interfaces\n"
+    for iface in $(ip link show | grep -E "^[0-9]+:" | grep -v "LOOPBACK" | awk -F': ' '{print $2}'); do
+        ip link set "$iface" down 2>/dev/null
+    done
 }
 
-# Wait for NetworkManager to be fully active and interfaces online
-nm_start_wait() {
-    NM=$(nm_service)
+# Bring network up - will use available method
+bring_network_up() {
+    printf " * Bringing up network interfaces"
     
-    if [ -z "$NM" ]; then
-        printf " * NetworkManager not found, bringing up interfaces manually\n"
-        # Manually bring up all interfaces with DHCP
-        for iface in $(ip link show | grep -E "^[0-9]+:" | grep -v "LOOPBACK" | awk -F': ' '{print $2}'); do
-            printf " * Bringing up %s" "$iface"
-            ip link set "$iface" up 2>/dev/null
-            sleep 1
-            # Request DHCP
-            dhclient "$iface" 2>/dev/null &
-            printf " (requesting DHCP)"
-        done
-        sleep 5
-        printf "\n"
-        
-        # Verify at least one interface has an IP
-        if ip addr show | grep -E "inet [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | grep -v "127.0.0.1" >/dev/null 2>&1; then
-            IP=$(ip addr show | grep -E "inet [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | grep -v "127.0.0.1" | awk '{print $2}' | cut -d'/' -f1 | head -1)
-            IFACE=$(ip addr show | grep -B5 "$IP" | grep "^[0-9]:" | awk '{print $2}' | sed 's/:$//' | head -1)
-            printf " * Network online: %s on %s\n" "$IP" "$IFACE"
-            return 0
-        else
-            printf "[!] Warning: No IP addresses assigned to interfaces\n"
-            return 1
-        fi
-    fi
+    # Get all non-loopback interfaces
+    INTERFACES=$(ip link show | grep -E "^[0-9]+:" | grep -v "LOOPBACK" | awk -F': ' '{print $2}')
     
-    printf " * Starting %s" "$NM"
-    
-    # Start the service
-    systemctl start "$NM" 2>/dev/null
-    if [ $? -ne 0 ]; then
-        printf " (failed to start)\n"
+    if [ -z "$INTERFACES" ]; then
+        printf " (no interfaces found)\n"
         return 1
     fi
     
-    # Wait for service to be active
-    COUNTER=0
-    MAX_WAIT=20
-    while [ $COUNTER -lt $MAX_WAIT ]; do
-        if systemctl is-active --quiet "$NM"; then
-            printf " (started)"
-            break
-        fi
+    # Bring up all interfaces
+    for iface in $INTERFACES; do
         printf "."
-        sleep 1
-        COUNTER=$((COUNTER + 1))
+        ip link set "$iface" up 2>/dev/null
     done
     
-    if [ $COUNTER -ge $MAX_WAIT ]; then
-        printf " (timeout - may not be running)\n"
-        return 1
+    printf " (up)"
+    
+    # Try to get DHCP on all interfaces
+    printf " (requesting DHCP)"
+    for iface in $INTERFACES; do
+        dhclient -v "$iface" 2>/dev/null &
+    done
+    
+    # Wait for DHCP to complete
+    sleep 5
+    
+    # Also try systemd-networkd if it's available
+    if systemctl is-enabled systemd-networkd 2>/dev/null; then
+        systemctl restart systemd-networkd 2>/dev/null
     fi
     
-    # Now wait for interfaces to come up with IP addresses
-    printf " (waiting for network)"
+    printf " (waiting)"
+    
+    # Wait for IP addresses to be assigned
     COUNTER=0
-    MAX_WAIT=30
+    MAX_WAIT=10
     while [ $COUNTER -lt $MAX_WAIT ]; do
-        # Check if any interface has an IP address (not 127.0.0.1)
         if ip addr show | grep -E "inet [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | grep -v "127.0.0.1" >/dev/null 2>&1; then
             IP=$(ip addr show | grep -E "inet [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | grep -v "127.0.0.1" | awk '{print $2}' | cut -d'/' -f1 | head -1)
             IFACE=$(ip addr show | grep -B5 "$IP" | grep "^[0-9]:" | awk '{print $2}' | sed 's/:$//' | head -1)
@@ -187,8 +157,54 @@ nm_start_wait() {
         COUNTER=$((COUNTER + 1))
     done
     
-    printf " (no IP assigned yet)\n"
-    printf "[!] Warning: Network may not be fully ready\n"
+    printf " (offline)\n"
+    printf "[!] Warning: Network may not have obtained IP address\n"
+    return 1
+}
+
+# Restore network - try all available methods
+restore_network() {
+    printf " * Restoring network"
+    
+    NM=$(nm_service)
+    if [ -n "$NM" ]; then
+        printf " (starting %s)" "$NM"
+        systemctl start "$NM" 2>/dev/null
+        sleep 3
+    fi
+    
+    # Also try to bring up interfaces and get DHCP
+    printf " (configuring interfaces)"
+    INTERFACES=$(ip link show | grep -E "^[0-9]+:" | grep -v "LOOPBACK" | awk -F': ' '{print $2}')
+    
+    for iface in $INTERFACES; do
+        ip link set "$iface" up 2>/dev/null
+        dhclient "$iface" 2>/dev/null &
+    done
+    
+    # Try systemd-networkd
+    if systemctl is-enabled systemd-networkd 2>/dev/null; then
+        systemctl restart systemd-networkd 2>/dev/null
+    fi
+    
+    sleep 5
+    
+    # Verify network is up
+    COUNTER=0
+    MAX_WAIT=10
+    while [ $COUNTER -lt $MAX_WAIT ]; do
+        if ip addr show | grep -E "inet [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | grep -v "127.0.0.1" >/dev/null 2>&1; then
+            IP=$(ip addr show | grep -E "inet [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | grep -v "127.0.0.1" | awk '{print $2}' | cut -d'/' -f1 | head -1)
+            IFACE=$(ip addr show | grep -B5 "$IP" | grep "^[0-9]:" | awk '{print $2}' | sed 's/:$//' | head -1)
+            printf " (online: %s on %s)\n" "$IP" "$IFACE"
+            return 0
+        fi
+        printf "."
+        sleep 1
+        COUNTER=$((COUNTER + 1))
+    done
+    
+    printf " (offline)\n"
     return 1
 }
 
@@ -450,9 +466,9 @@ do_start() {
         printf "\n"
     fi
 
-    # Start network and wait for it to be ready
+    # Bring network online
     printf "\n[*] Bringing network online...\n"
-    nm_start_wait
+    bring_network_up
     
     printf "\n"
 }
@@ -515,7 +531,7 @@ do_stop() {
 
     # Restore network
     printf "\n[*] Restoring network...\n"
-    nm_start_wait
+    restore_network
 
     systemctl restart tor
 
