@@ -4,7 +4,7 @@
 # Updated for modern Kali Linux (systemd, iproute2, systemd-resolved)
 # Author: MardoxTV
 # Maintained by: MardoxTV
-# Version: 2.4
+# Version: 2.5
 
 # List, separated by spaces, of destinations you do NOT want routed through Tor
 NON_TOR="192.168.0.0/16 172.16.0.0/12"
@@ -224,47 +224,89 @@ wait_for_tor() {
     return 1
 }
 
-# Verify DNS is working
-verify_dns() {
-    printf " * Verifying DNS configuration"
-    COUNTER=0
-    MAX_WAIT=10
+# Configure and verify DNS
+configure_dns() {
+    printf " * Configuring DNS"
     
-    while [ $COUNTER -lt $MAX_WAIT ]; do
-        # Try to resolve a simple DNS query
+    # Stop systemd-resolved and ensure it stays stopped
+    systemctl stop systemd-resolved 2>/dev/null
+    systemctl mask systemd-resolved 2>/dev/null
+    
+    # Remove any symlink that might exist
+    rm -f /etc/resolv.conf 2>/dev/null
+    
+    # Create a proper resolv.conf file (not a symlink)
+    cat > /etc/resolv.conf << 'DNSEOF'
+nameserver 127.0.0.1
+options timeout:1 attempts:1
+DNSEOF
+    
+    # Make it immutable to prevent systemd from modifying it
+    chattr +i /etc/resolv.conf 2>/dev/null
+    
+    printf " (configured)"
+    
+    # Test DNS with retries
+    COUNTER=0
+    MAX_RETRIES=5
+    
+    while [ $COUNTER -lt $MAX_RETRIES ]; do
+        printf "."
+        
         if nslookup google.com 127.0.0.1 2>/dev/null | grep -q "Address" || \
            dig @127.0.0.1 google.com +short 2>/dev/null | grep -q "[0-9]"; then
             printf " (working)\n"
             return 0
         fi
         
-        printf "."
         sleep 1
         COUNTER=$((COUNTER + 1))
     done
     
-    printf " (not responding)\n"
-    printf "[!] Warning: DNS may not be configured correctly\n"
+    printf " (not responding yet, continuing)\n"
     return 1
 }
 
-# Check if network is up
-check_network() {
-    printf " * Checking network interfaces"
+# Check and configure network
+configure_network() {
+    printf " * Configuring network interfaces"
     
-    # Check if any interface is up and has an IP
-    INTERFACE=$(ip addr show | grep "UP" | grep -v "LOOPBACK" | awk '{print $2}' | sed 's/:$//' | head -1)
+    # Get all non-loopback interfaces
+    INTERFACES=$(ip link show | grep "UP" | grep -v "LOOPBACK" | awk -F': ' '{print $2}' | sed 's/:$//')
     
-    if [ -n "$INTERFACE" ]; then
-        IP=$(ip addr show "$INTERFACE" | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
-        if [ -n "$IP" ]; then
-            printf " (online: %s on %s)\n" "$IP" "$INTERFACE"
-            return 0
-        fi
+    if [ -z "$INTERFACES" ]; then
+        INTERFACES=$(ip link show | grep -E "^\d+:" | grep -v "LOOPBACK" | awk -F': ' '{print $2}')
     fi
     
-    printf " (offline)\n"
-    printf "[!] Warning: No network interface is up\n"
+    if [ -z "$INTERFACES" ]; then
+        printf " (no interfaces found)\n"
+        return 1
+    fi
+    
+    # Bring up all interfaces and renew DHCP
+    for IFACE in $INTERFACES; do
+        printf "."
+        ip link set "$IFACE" up 2>/dev/null
+        sleep 0.5
+    done
+    
+    # Renew DHCP leases
+    for IFACE in $INTERFACES; do
+        dhclient "$IFACE" 2>/dev/null &
+    done
+    
+    sleep 3
+    
+    # Verify at least one interface is up
+    ACTIVE=$(ip addr show | grep "inet " | grep -v "127.0.0.1" | awk '{print $NF}' | head -1)
+    
+    if [ -n "$ACTIVE" ]; then
+        IP=$(ip addr show "$ACTIVE" | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
+        printf " (online: %s on %s)\n" "$IP" "$ACTIVE"
+        return 0
+    fi
+    
+    printf " (offline - no IP assigned)\n"
     return 1
 }
 
@@ -275,6 +317,7 @@ redirect_to_tor() {
     # Ensure Tor is running and start it if needed
     if ! systemctl is-active --quiet tor; then
         printf "[*] Starting Tor service...\n"
+        systemctl unmask tor 2>/dev/null
         systemctl restart tor
         wait_for_tor
     else
@@ -289,18 +332,17 @@ redirect_to_tor() {
     # Backup original resolv.conf before modifying it
     if [ ! -f "$DNS_BACKUP" ]; then
         if [ -f /etc/resolv.conf ]; then
-            cp /etc/resolv.conf "$DNS_BACKUP"
+            cp /etc/resolv.conf "$DNS_BACKUP" 2>/dev/null
             printf " * Backed up original resolv.conf\n"
         fi
     fi
 
     iptables_flush
 
-    # Stop systemd-resolved so we can override DNS
-    systemctl stop systemd-resolved 2>/dev/null
-    printf "nameserver 127.0.0.1\n" > /etc/resolv.conf
-    printf " * Modified resolv.conf to use Tor\n"
-
+    # Configure DNS
+    configure_dns
+    
+    # Set up iptables rules
     iptables -t nat -A OUTPUT -m owner --uid-owner $TOR_UID -j RETURN
     iptables -t nat -A OUTPUT -p udp --dport 53 -j REDIRECT --to-ports 53
 
@@ -367,10 +409,9 @@ do_start() {
 
     nm_start
     
-    # Verify the setup
-    printf "\n[*] Verifying configuration...\n"
-    check_network
-    verify_dns
+    # Configure and verify network and DNS
+    printf "\n[*] Finalizing configuration...\n"
+    configure_network
     
     printf "\n"
 }
@@ -392,13 +433,17 @@ do_stop() {
 
     # Restore DNS configuration from backup
     if [ -f "$DNS_BACKUP" ]; then
+        # Make resolv.conf mutable again
+        chattr -i /etc/resolv.conf 2>/dev/null
         cp "$DNS_BACKUP" /etc/resolv.conf
         rm "$DNS_BACKUP"
         printf " * Restored original DNS configuration\n"
     else
-        # Fallback: restore systemd-resolved and create symlink
+        # Fallback: restore systemd-resolved
+        chattr -i /etc/resolv.conf 2>/dev/null
+        systemctl unmask systemd-resolved 2>/dev/null
         systemctl start systemd-resolved 2>/dev/null
-        sleep 1
+        sleep 2
         # Remove any existing resolv.conf file
         rm -f /etc/resolv.conf 2>/dev/null
         # Create proper symlink to systemd-resolved
