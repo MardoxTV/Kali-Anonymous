@@ -4,7 +4,7 @@
 # Updated for modern Kali Linux (systemd, iproute2, systemd-resolved)
 # Author: MardoxTV
 # Maintained by: MardoxTV
-# Version: 2.8
+# Version: 2.9
 
 # List, separated by spaces, of destinations you do NOT want routed through Tor
 NON_TOR="192.168.0.0/16 172.16.0.0/12"
@@ -79,7 +79,6 @@ check_root() {
 
 # Detect the correct network manager service name
 nm_service() {
-    # Check if service files exist (more reliable than checking running units)
     if [ -f "/etc/systemd/system/NetworkManager.service" ] || \
        [ -f "/usr/lib/systemd/system/NetworkManager.service" ] || \
        [ -f "/lib/systemd/system/NetworkManager.service" ]; then
@@ -126,14 +125,18 @@ bring_network_up() {
     
     printf " (up)"
     
+    # Kill any existing DHCP processes
+    killall dhclient 2>/dev/null
+    sleep 1
+    
     # Try to get DHCP on all interfaces
-    printf " (requesting DHCP)"
+    printf " (DHCP)"
     for iface in $INTERFACES; do
         dhclient -v "$iface" 2>/dev/null &
     done
     
     # Wait for DHCP to complete
-    sleep 5
+    sleep 8
     
     # Also try systemd-networkd if it's available
     if systemctl is-enabled systemd-networkd 2>/dev/null; then
@@ -179,6 +182,13 @@ restore_network() {
     
     for iface in $INTERFACES; do
         ip link set "$iface" up 2>/dev/null
+    done
+    
+    # Kill existing DHCP and restart
+    killall dhclient 2>/dev/null
+    sleep 1
+    
+    for iface in $INTERFACES; do
         dhclient "$iface" 2>/dev/null &
     done
     
@@ -187,7 +197,7 @@ restore_network() {
         systemctl restart systemd-networkd 2>/dev/null
     fi
     
-    sleep 5
+    sleep 8
     
     # Verify network is up
     COUNTER=0
@@ -460,15 +470,16 @@ do_start() {
         fi
     fi
 
+    # CRITICAL: Bring network ONLINE BEFORE setting up Tor rules
+    printf "\n[*] Bringing network online...\n"
+    bring_network_up
+
+    # NOW set up Tor transparent proxy
     if ask "Do you want to transparently route traffic through Tor?" Y; then
         redirect_to_tor
     else
         printf "\n"
     fi
-
-    # Bring network online
-    printf "\n[*] Bringing network online...\n"
-    bring_network_up
     
     printf "\n"
 }
