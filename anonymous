@@ -4,7 +4,7 @@
 # Updated for modern Kali Linux (systemd, iproute2, systemd-resolved)
 # Author: MardoxTV
 # Maintained by: MardoxTV
-# Version: 2.9
+# Version: 3.0
 
 # List, separated by spaces, of destinations you do NOT want routed through Tor
 NON_TOR="192.168.0.0/16 172.16.0.0/12"
@@ -27,13 +27,22 @@ OVERWRITE="true"
 # The default local hostname
 REAL_HOSTNAME="kali"
 
-# DNS backup file location
-DNS_BACKUP="/etc/network/resolv.conf.backup"
+# State directory for backup files (created on demand)
+STATE_DIR="/var/lib/kali-anonymous"
+DNS_BACKUP="$STATE_DIR/resolv.conf.backup"
+IPTABLES_BACKUP="$STATE_DIR/iptables.rules"
+IP6TABLES_BACKUP="$STATE_DIR/ip6tables.rules"
+RESOLVED_STATE_FILE="$STATE_DIR/resolved.state"
 
 # Include default options, if any
 if [ -f /etc/default/kali-anonymous ] ; then
     . /etc/default/kali-anonymous
 fi
+
+# Make sure state directory exists; required for backups during start/stop
+ensure_state_dir() {
+    mkdir -p "$STATE_DIR" 2>/dev/null
+}
 
 warning() {
     printf "\n[!] WARNING! This script mitigates common system data leaks.\n"
@@ -92,130 +101,184 @@ nm_service() {
     fi
 }
 
+# List real physical network interfaces (skip loopback + virtual)
+list_interfaces() {
+    ip -o link show 2>/dev/null \
+        | awk -F': ' '{print $2}' \
+        | sed 's/@.*//' \
+        | grep -Ev '^(lo|docker|br-|veth|tun|tap|virbr|bond|dummy|sit|gre|teql|ifb|vmnet|vboxnet|wg)' \
+        | sort -u
+}
+
+# Get the first non-loopback IPv4 address currently assigned, blank if none
+current_ipv4() {
+    ip -4 -o addr show scope global 2>/dev/null \
+        | awk '{print $4}' \
+        | cut -d'/' -f1 \
+        | head -n1
+}
+
+# Get the interface that owns a given IPv4 address
+iface_for_ip() {
+    ip -4 -o addr show 2>/dev/null \
+        | awk -v ip="$1" '$4 ~ "^"ip"/" {print $2; exit}'
+}
+
 nm_stop() {
     NM=$(nm_service)
     if [ -n "$NM" ]; then
-        systemctl stop "$NM" 2>/dev/null && printf " * Stopped %s\n" "$NM" || printf " * Failed to stop %s\n" "$NM"
+        if systemctl is-active --quiet "$NM"; then
+            if systemctl stop "$NM" 2>/dev/null; then
+                printf " * Stopped %s\n" "$NM"
+            else
+                printf " * Failed to stop %s\n" "$NM"
+            fi
+        else
+            printf " * %s already stopped\n" "$NM"
+        fi
     fi
-    
-    # Always bring down interfaces explicitly
-    printf " * Bringing down network interfaces\n"
-    for iface in $(ip link show | grep -E "^[0-9]+:" | grep -v "LOOPBACK" | awk -F': ' '{print $2}'); do
-        ip link set "$iface" down 2>/dev/null
-    done
+
+    # NOTE: we intentionally do NOT bring interfaces down here. Doing so
+    # disconnects wifi entirely (wpa_supplicant needs NM to reassociate) and
+    # drops IP/routes on ethernet too. Stopping NM alone leaves the existing
+    # connection's IP and routes in place until something else changes them,
+    # which keeps the user online between nm_stop and bring_network_up.
 }
 
-# Bring network up - will use available method
+# Wait for an IPv4 lease, polling once a second up to MAX_WAIT
+wait_for_ipv4() {
+    MAX_WAIT="${1:-20}"
+    COUNTER=0
+    while [ "$COUNTER" -lt "$MAX_WAIT" ]; do
+        IP=$(current_ipv4)
+        if [ -n "$IP" ]; then
+            IFACE=$(iface_for_ip "$IP")
+            printf " (online: %s on %s)\n" "$IP" "${IFACE:-unknown}"
+            return 0
+        fi
+        printf "."
+        sleep 1
+        COUNTER=$((COUNTER + 1))
+    done
+    printf " (offline)\n"
+    return 1
+}
+
+# Try NetworkManager first; if unavailable or fails, run dhclient manually
 bring_network_up() {
-    printf " * Bringing up network interfaces"
-    
-    # Get all non-loopback interfaces
-    INTERFACES=$(ip link show | grep -E "^[0-9]+:" | grep -v "LOOPBACK" | awk -F': ' '{print $2}')
-    
+    printf " * Bringing network online"
+
+    INTERFACES=$(list_interfaces)
     if [ -z "$INTERFACES" ]; then
-        printf " (no interfaces found)\n"
+        printf " (no physical interfaces detected)\n"
         return 1
     fi
-    
-    # Bring up all interfaces
+
+    # Make sure the link layer is up regardless of how DHCP is acquired
     for iface in $INTERFACES; do
-        printf "."
         ip link set "$iface" up 2>/dev/null
     done
-    
-    printf " (up)"
-    
-    # Kill any existing DHCP processes
-    killall dhclient 2>/dev/null
-    sleep 1
-    
-    # Try to get DHCP on all interfaces
-    printf " (DHCP)"
-    for iface in $INTERFACES; do
-        dhclient -v "$iface" 2>/dev/null &
-    done
-    
-    # Wait for DHCP to complete
-    sleep 8
-    
-    # Also try systemd-networkd if it's available
-    if systemctl is-enabled systemd-networkd 2>/dev/null; then
-        systemctl restart systemd-networkd 2>/dev/null
-    fi
-    
-    printf " (waiting)"
-    
-    # Wait for IP addresses to be assigned
-    COUNTER=0
-    MAX_WAIT=10
-    while [ $COUNTER -lt $MAX_WAIT ]; do
-        if ip addr show | grep -E "inet [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | grep -v "127.0.0.1" >/dev/null 2>&1; then
-            IP=$(ip addr show | grep -E "inet [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | grep -v "127.0.0.1" | awk '{print $2}' | cut -d'/' -f1 | head -1)
-            IFACE=$(ip addr show | grep -B5 "$IP" | grep "^[0-9]:" | awk '{print $2}' | sed 's/:$//' | head -1)
-            printf " (online: %s on %s)\n" "$IP" "$IFACE"
+
+    NM=$(nm_service)
+    if [ -n "$NM" ] && command -v nmcli >/dev/null 2>&1; then
+        printf " (via %s)" "$NM"
+        systemctl start "$NM" 2>/dev/null
+        # Give NM a moment to take over the interfaces
+        sleep 2
+        nmcli networking on 2>/dev/null
+
+        # Wait for NM to report 'connected' or for any IPv4 address
+        printf " (waiting)"
+        COUNTER=0
+        while [ "$COUNTER" -lt 30 ]; do
+            STATE=$(nmcli -t -f STATE general 2>/dev/null | head -n1)
+            if [ "$STATE" = "connected" ] || [ -n "$(current_ipv4)" ]; then
+                break
+            fi
+            printf "."
+            sleep 1
+            COUNTER=$((COUNTER + 1))
+        done
+
+        if [ -n "$(current_ipv4)" ]; then
+            IP=$(current_ipv4)
+            IFACE=$(iface_for_ip "$IP")
+            printf " (online: %s on %s)\n" "$IP" "${IFACE:-unknown}"
             return 0
         fi
-        printf "."
-        sleep 1
-        COUNTER=$((COUNTER + 1))
+        printf " (NM didn't obtain a lease, falling back to dhclient)\n"
+    fi
+
+    # Manual fallback: dhclient on each real interface
+    printf " * Requesting DHCP lease"
+    pkill -x dhclient 2>/dev/null
+    sleep 1
+    for iface in $INTERFACES; do
+        dhclient -nw "$iface" 2>/dev/null
     done
-    
-    printf " (offline)\n"
-    printf "[!] Warning: Network may not have obtained IP address\n"
-    return 1
+
+    # systemd-networkd as a secondary fallback
+    if systemctl is-enabled systemd-networkd >/dev/null 2>&1; then
+        systemctl restart systemd-networkd 2>/dev/null
+    fi
+
+    wait_for_ipv4 20
+    if [ -z "$(current_ipv4)" ]; then
+        printf "[!] Warning: Network did not obtain an IP address\n"
+        return 1
+    fi
+    return 0
 }
 
-# Restore network - try all available methods
+# Restore network - same strategy as bring_network_up
 restore_network() {
     printf " * Restoring network"
-    
-    NM=$(nm_service)
-    if [ -n "$NM" ]; then
-        printf " (starting %s)" "$NM"
-        systemctl start "$NM" 2>/dev/null
-        sleep 3
-    fi
-    
-    # Also try to bring up interfaces and get DHCP
-    printf " (configuring interfaces)"
-    INTERFACES=$(ip link show | grep -E "^[0-9]+:" | grep -v "LOOPBACK" | awk -F': ' '{print $2}')
-    
+
+    INTERFACES=$(list_interfaces)
     for iface in $INTERFACES; do
         ip link set "$iface" up 2>/dev/null
     done
-    
-    # Kill existing DHCP and restart
-    killall dhclient 2>/dev/null
-    sleep 1
-    
-    for iface in $INTERFACES; do
-        dhclient "$iface" 2>/dev/null &
-    done
-    
-    # Try systemd-networkd
-    if systemctl is-enabled systemd-networkd 2>/dev/null; then
-        systemctl restart systemd-networkd 2>/dev/null
-    fi
-    
-    sleep 8
-    
-    # Verify network is up
-    COUNTER=0
-    MAX_WAIT=10
-    while [ $COUNTER -lt $MAX_WAIT ]; do
-        if ip addr show | grep -E "inet [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | grep -v "127.0.0.1" >/dev/null 2>&1; then
-            IP=$(ip addr show | grep -E "inet [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | grep -v "127.0.0.1" | awk '{print $2}' | cut -d'/' -f1 | head -1)
-            IFACE=$(ip addr show | grep -B5 "$IP" | grep "^[0-9]:" | awk '{print $2}' | sed 's/:$//' | head -1)
-            printf " (online: %s on %s)\n" "$IP" "$IFACE"
+
+    NM=$(nm_service)
+    if [ -n "$NM" ] && command -v nmcli >/dev/null 2>&1; then
+        printf " (via %s)" "$NM"
+        systemctl start "$NM" 2>/dev/null
+        sleep 2
+        nmcli networking on 2>/dev/null
+
+        printf " (waiting)"
+        COUNTER=0
+        while [ "$COUNTER" -lt 30 ]; do
+            STATE=$(nmcli -t -f STATE general 2>/dev/null | head -n1)
+            if [ "$STATE" = "connected" ] || [ -n "$(current_ipv4)" ]; then
+                break
+            fi
+            printf "."
+            sleep 1
+            COUNTER=$((COUNTER + 1))
+        done
+
+        if [ -n "$(current_ipv4)" ]; then
+            IP=$(current_ipv4)
+            IFACE=$(iface_for_ip "$IP")
+            printf " (online: %s on %s)\n" "$IP" "${IFACE:-unknown}"
             return 0
         fi
-        printf "."
-        sleep 1
-        COUNTER=$((COUNTER + 1))
+        printf " (no lease via NM, falling back to dhclient)\n"
+    fi
+
+    printf " * Requesting DHCP lease"
+    pkill -x dhclient 2>/dev/null
+    sleep 1
+    for iface in $INTERFACES; do
+        dhclient -nw "$iface" 2>/dev/null
     done
-    
-    printf " (offline)\n"
-    return 1
+
+    if systemctl is-enabled systemd-networkd >/dev/null 2>&1; then
+        systemctl restart systemd-networkd 2>/dev/null
+    fi
+
+    wait_for_ipv4 20
 }
 
 # Kill processes at startup
@@ -263,9 +326,9 @@ change_hostname() {
 
     hostname "$NEW_HOSTNAME"
 
-    if [ -f "$HOME/.Xauthority" ] ; then
-        su "$SUDO_USER" -c "xauth -n list | grep -v $CURRENT_HOSTNAME | cut -f1 -d' ' | xargs -I{} xauth remove {}"
-        su "$SUDO_USER" -c "xauth add \$(xauth -n list | tail -1 | sed 's/^.*\//'$NEW_HOSTNAME'\//g')"
+    if [ -n "${SUDO_USER:-}" ] && [ -f "/home/$SUDO_USER/.Xauthority" ]; then
+        su "$SUDO_USER" -c "xauth -n list | grep -v $CURRENT_HOSTNAME | cut -f1 -d' ' | xargs -I{} xauth remove {}" 2>/dev/null
+        su "$SUDO_USER" -c "xauth add \$(xauth -n list | tail -1 | sed 's/^.*\//'$NEW_HOSTNAME'\//g')" 2>/dev/null
         printf " * X authority file updated\n"
     fi
 
@@ -278,24 +341,42 @@ change_hostname() {
 change_mac() {
     printf "Choose a network interface:\n"
     printf '%s\n' "----------------------------"
-    ls /sys/class/net
+    list_interfaces
+    printf '%s\n' "----------------------------"
     read -p ">>> " macintosh
     printf "\n"
 
-    ip link set "$macintosh" down
-    macchanger -r "$macintosh"
-    ip link set "$macintosh" up
+    if [ -z "$macintosh" ] || [ ! -e "/sys/class/net/$macintosh" ]; then
+        printf "[!] Interface '%s' does not exist, skipping MAC change\n" "$macintosh"
+        return 1
+    fi
+
+    # If NetworkManager is up, ask it to release the device first so macchanger can take it down
+    if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet "$(nm_service)" 2>/dev/null; then
+        nmcli device disconnect "$macintosh" 2>/dev/null
+    fi
+
+    if ! ip link set "$macintosh" down 2>/dev/null; then
+        printf "[!] Could not bring %s down, MAC change may fail\n" "$macintosh"
+    fi
+    macchanger -r "$macintosh" || printf "[!] macchanger failed on %s\n" "$macintosh"
+    ip link set "$macintosh" up 2>/dev/null
     macchanger -s "$macintosh"
 }
 
 # Check Tor config entries required for transparent proxying
 check_configs() {
-    MISSING=0
+    if [ ! -f /etc/tor/torrc ]; then
+        printf "\n[!] /etc/tor/torrc not found. Is Tor installed?\n"
+        printf "    Run 'sudo ./setup' from the repo to install dependencies.\n\n"
+        exit 1
+    fi
 
+    MISSING=0
     grep -q -x 'VirtualAddrNetwork 10.192.0.0/10' /etc/tor/torrc || MISSING=1
     grep -q -x 'TransPort 9040'                   /etc/tor/torrc || MISSING=1
-    grep -q -x 'DNSPort 53'                        /etc/tor/torrc || MISSING=1
-    grep -q -x 'AutomapHostsOnResolve 1'           /etc/tor/torrc || MISSING=1
+    grep -q -x 'DNSPort 53'                       /etc/tor/torrc || MISSING=1
+    grep -q -x 'AutomapHostsOnResolve 1'          /etc/tor/torrc || MISSING=1
 
     if [ $MISSING -ne 0 ]; then
         printf "\n[!] Please add the following to /etc/tor/torrc and restart Tor:\n\n"
@@ -308,29 +389,99 @@ check_configs() {
 }
 
 iptables_flush() {
-    iptables -F
-    iptables -t nat -F
+    iptables -F 2>/dev/null
+    iptables -X 2>/dev/null
+    iptables -t nat -F 2>/dev/null
+    iptables -t nat -X 2>/dev/null
+    iptables -t mangle -F 2>/dev/null
+    iptables -t mangle -X 2>/dev/null
     printf " * Deleted all iptables rules\n"
 }
 
-# Wait for Tor to be ready
+ip6tables_flush() {
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -F 2>/dev/null
+        ip6tables -X 2>/dev/null
+        ip6tables -t nat -F 2>/dev/null
+        ip6tables -t nat -X 2>/dev/null
+        ip6tables -t mangle -F 2>/dev/null
+        ip6tables -t mangle -X 2>/dev/null
+    fi
+}
+
+# Disable IPv6 system-wide to prevent leaks (Tor iptables rules cover IPv4 only)
+disable_ipv6() {
+    printf " * Disabling IPv6 to prevent leaks\n"
+    sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1
+    sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1
+    sysctl -w net.ipv6.conf.lo.disable_ipv6=1 >/dev/null 2>&1
+
+    # Backup ip6tables rules and install a hard block as a second layer
+    if command -v ip6tables >/dev/null 2>&1; then
+        if ! [ -f "$IP6TABLES_BACKUP" ]; then
+            ip6tables-save > "$IP6TABLES_BACKUP" 2>/dev/null
+        fi
+        ip6tables_flush
+        ip6tables -P INPUT DROP 2>/dev/null
+        ip6tables -P OUTPUT DROP 2>/dev/null
+        ip6tables -P FORWARD DROP 2>/dev/null
+    fi
+}
+
+# Re-enable IPv6 and restore ip6tables defaults
+enable_ipv6() {
+    sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
+    sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
+    sysctl -w net.ipv6.conf.lo.disable_ipv6=0 >/dev/null 2>&1
+
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -P INPUT ACCEPT 2>/dev/null
+        ip6tables -P OUTPUT ACCEPT 2>/dev/null
+        ip6tables -P FORWARD ACCEPT 2>/dev/null
+        ip6tables_flush
+        if [ -f "$IP6TABLES_BACKUP" ]; then
+            ip6tables-restore < "$IP6TABLES_BACKUP" 2>/dev/null
+            rm -f "$IP6TABLES_BACKUP"
+        fi
+    fi
+}
+
+# Wait for Tor to be ready: both the DNS and TransPort must be listening,
+# and Tor must have finished bootstrapping.
 wait_for_tor() {
     printf " * Waiting for Tor to initialize"
     COUNTER=0
-    MAX_WAIT=30
-    
+    MAX_WAIT=60
+
     while [ $COUNTER -lt $MAX_WAIT ]; do
-        # Check if Tor is listening on the TransPort
-        if netstat -tuln 2>/dev/null | grep -q ":9040\|:53" || ss -tuln 2>/dev/null | grep -q ":9040\|:53"; then
-            printf " (ready)\n"
-            return 0
+        # Prefer ss (iproute2); fall back to netstat (net-tools)
+        if command -v ss >/dev/null 2>&1; then
+            PORTS=$(ss -tuln 2>/dev/null)
+        else
+            PORTS=$(netstat -tuln 2>/dev/null)
         fi
-        
+
+        if echo "$PORTS" | grep -qE ":$TRANS_PORT([[:space:]]|$)" && \
+           echo "$PORTS" | grep -qE ":53([[:space:]]|$)"; then
+            # Both ports are listening; check bootstrap status if possible
+            if command -v journalctl >/dev/null 2>&1 && \
+               journalctl -u tor -n 50 --no-pager 2>/dev/null | grep -q "Bootstrapped 100"; then
+                printf " (ready, bootstrapped)\n"
+                return 0
+            fi
+            # If we can't read the journal, accept "both ports listening" as ready
+            # after at least 3 seconds to give Tor time to bootstrap.
+            if [ "$COUNTER" -ge 3 ]; then
+                printf " (ready)\n"
+                return 0
+            fi
+        fi
+
         printf "."
         sleep 1
         COUNTER=$((COUNTER + 1))
     done
-    
+
     printf " (timeout)\n"
     printf "[!] Warning: Tor may not be fully initialized\n"
     return 1
@@ -339,42 +490,56 @@ wait_for_tor() {
 # Configure DNS to use Tor
 configure_dns() {
     printf " * Configuring DNS"
-    
-    # Stop systemd-resolved and ensure it stays stopped
+
+    ensure_state_dir
+
+    # Record systemd-resolved's prior state so we can restore correctly on stop
+    if systemctl is-enabled systemd-resolved 2>/dev/null | grep -q "masked"; then
+        echo "masked" > "$RESOLVED_STATE_FILE"
+    elif systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        echo "active" > "$RESOLVED_STATE_FILE"
+    else
+        echo "inactive" > "$RESOLVED_STATE_FILE"
+    fi
+
+    # Stop systemd-resolved and prevent it from coming back during the session
     systemctl stop systemd-resolved 2>/dev/null
     systemctl mask systemd-resolved 2>/dev/null
-    
-    # Remove any symlink that might exist
+
+    # Clear any immutable flag from a previous run, then remove the symlink/file
+    chattr -i /etc/resolv.conf 2>/dev/null
     rm -f /etc/resolv.conf 2>/dev/null
-    
-    # Create a proper resolv.conf file (not a symlink)
+
+    # Write a plain resolv.conf pointing at Tor's local DNSPort
     cat > /etc/resolv.conf << 'DNSEOF'
 nameserver 127.0.0.1
 options timeout:1 attempts:1
 DNSEOF
-    
-    # Make it immutable to prevent systemd from modifying it
+
+    # Best-effort immutability — fails silently on filesystems that don't support it
     chattr +i /etc/resolv.conf 2>/dev/null
-    
+
     printf " (configured)"
-    
-    # Test DNS with retries
+
+    # Test DNS via Tor with a few retries
     COUNTER=0
-    MAX_RETRIES=5
-    
+    MAX_RETRIES=8
     while [ $COUNTER -lt $MAX_RETRIES ]; do
         printf "."
-        
-        if nslookup google.com 127.0.0.1 2>/dev/null | grep -q "Address" || \
-           dig @127.0.0.1 google.com +short 2>/dev/null | grep -q "[0-9]"; then
+        if command -v dig >/dev/null 2>&1 && \
+           dig @127.0.0.1 -p 53 google.com +short +time=2 +tries=1 2>/dev/null | grep -qE '^[0-9]+\.'; then
             printf " (working)\n"
             return 0
         fi
-        
+        if command -v nslookup >/dev/null 2>&1 && \
+           nslookup google.com 127.0.0.1 2>/dev/null | grep -qE "Address[ :]+[0-9]+\."; then
+            printf " (working)\n"
+            return 0
+        fi
         sleep 1
         COUNTER=$((COUNTER + 1))
     done
-    
+
     printf " (not responding yet, continuing)\n"
     return 1
 }
@@ -393,41 +558,44 @@ redirect_to_tor() {
         printf "[*] Tor is already running\n"
     fi
 
-    if ! [ -f /etc/network/iptables.rules ]; then
-        iptables-save > /etc/network/iptables.rules
+    ensure_state_dir
+
+    if ! [ -f "$IPTABLES_BACKUP" ]; then
+        iptables-save > "$IPTABLES_BACKUP" 2>/dev/null
         printf " * Saved iptables rules\n"
     fi
 
-    # Backup original resolv.conf before modifying it
-    if [ ! -f "$DNS_BACKUP" ]; then
-        if [ -f /etc/resolv.conf ]; then
-            cp /etc/resolv.conf "$DNS_BACKUP" 2>/dev/null
-            printf " * Backed up original resolv.conf\n"
-        fi
+    # Backup original resolv.conf before modifying it (resolve symlink target)
+    if [ ! -f "$DNS_BACKUP" ] && [ -e /etc/resolv.conf ]; then
+        cp -L /etc/resolv.conf "$DNS_BACKUP" 2>/dev/null
+        printf " * Backed up original resolv.conf\n"
     fi
+
+    # Block IPv6 BEFORE building IPv4 rules — closes the leak window
+    disable_ipv6
 
     iptables_flush
 
     # Configure DNS
     configure_dns
-    
+
     # Set up iptables rules
-    iptables -t nat -A OUTPUT -m owner --uid-owner $TOR_UID -j RETURN
+    iptables -t nat -A OUTPUT -m owner --uid-owner "$TOR_UID" -j RETURN
     iptables -t nat -A OUTPUT -p udp --dport 53 -j REDIRECT --to-ports 53
 
     for NET in $NON_TOR 127.0.0.0/9 127.128.0.0/10; do
         iptables -t nat -A OUTPUT -d "$NET" -j RETURN
     done
 
-    iptables -t nat -A OUTPUT -p tcp --syn -j REDIRECT --to-ports $TRANS_PORT
-    iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+    iptables -t nat -A OUTPUT -p tcp --syn -j REDIRECT --to-ports "$TRANS_PORT"
+    iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
     for NET in $NON_TOR 127.0.0.0/8; do
         iptables -A OUTPUT -d "$NET" -j ACCEPT
     done
 
-    iptables -A OUTPUT -m owner --uid-owner $TOR_UID -j ACCEPT
-    iptables -A OUTPUT -j REJECT
+    iptables -A OUTPUT -m owner --uid-owner "$TOR_UID" -j ACCEPT
+    iptables -A OUTPUT -j REJECT --reject-with icmp-port-unreachable
 
     printf " * Tor transparent proxy configured\n"
 }
@@ -445,8 +613,9 @@ do_bleachbit() {
 }
 
 do_start() {
-    check_configs
     check_root
+    check_configs
+    ensure_state_dir
 
     warning
 
@@ -489,34 +658,65 @@ do_stop() {
 
     printf "\n[i] Stopping anonymous mode\n\n"
 
+    ensure_state_dir
+
     nm_stop
 
     iptables_flush
 
-    if [ -f /etc/network/iptables.rules ]; then
-        iptables-restore < /etc/network/iptables.rules
-        rm /etc/network/iptables.rules
+    if [ -f "$IPTABLES_BACKUP" ]; then
+        iptables-restore < "$IPTABLES_BACKUP" 2>/dev/null
+        rm -f "$IPTABLES_BACKUP"
         printf " * Restored iptables rules\n"
     fi
 
-    # Restore DNS configuration from backup
-    if [ -f "$DNS_BACKUP" ]; then
-        # Make resolv.conf mutable again
-        chattr -i /etc/resolv.conf 2>/dev/null
-        cp "$DNS_BACKUP" /etc/resolv.conf
-        rm "$DNS_BACKUP"
-        printf " * Restored original DNS configuration\n"
-    else
-        # Fallback: restore systemd-resolved
-        chattr -i /etc/resolv.conf 2>/dev/null
+    # Re-enable IPv6 and clear our ip6tables block
+    enable_ipv6
+
+    # Always drop the immutable flag before touching resolv.conf
+    chattr -i /etc/resolv.conf 2>/dev/null
+
+    # Recall systemd-resolved's prior state (we masked it during start)
+    RESOLVED_PRIOR=""
+    if [ -f "$RESOLVED_STATE_FILE" ]; then
+        RESOLVED_PRIOR=$(cat "$RESOLVED_STATE_FILE" 2>/dev/null)
+        rm -f "$RESOLVED_STATE_FILE"
+    fi
+
+    # If we masked systemd-resolved earlier, unmask it unconditionally so DNS
+    # works again — otherwise restoring resolv.conf pointing at 127.0.0.53
+    # would fail because nothing is listening there.
+    if [ "$RESOLVED_PRIOR" != "masked" ]; then
         systemctl unmask systemd-resolved 2>/dev/null
+    fi
+
+    if [ "$RESOLVED_PRIOR" = "active" ]; then
+        # Original setup was systemd-resolved; bring it back up
         systemctl start systemd-resolved 2>/dev/null
-        sleep 2
-        # Remove any existing resolv.conf file
+        sleep 1
         rm -f /etc/resolv.conf 2>/dev/null
-        # Create proper symlink to systemd-resolved
         ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null
         printf " * Restored systemd-resolved DNS\n"
+    elif [ -f "$DNS_BACKUP" ]; then
+        rm -f /etc/resolv.conf 2>/dev/null
+        cp "$DNS_BACKUP" /etc/resolv.conf 2>/dev/null
+        rm -f "$DNS_BACKUP"
+        printf " * Restored original DNS configuration\n"
+    elif systemctl list-unit-files 2>/dev/null | grep -q '^systemd-resolved'; then
+        systemctl unmask systemd-resolved 2>/dev/null
+        systemctl start systemd-resolved 2>/dev/null
+        sleep 1
+        rm -f /etc/resolv.conf 2>/dev/null
+        ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null
+        printf " * Restored systemd-resolved DNS\n"
+    else
+        # No backup and no systemd-resolved: leave a sensible default
+        rm -f /etc/resolv.conf 2>/dev/null
+        cat > /etc/resolv.conf << 'DNSEOF'
+nameserver 1.1.1.1
+nameserver 9.9.9.9
+DNSEOF
+        printf " * Wrote fallback resolv.conf (1.1.1.1, 9.9.9.9)\n"
     fi
 
     kill_process
@@ -565,10 +765,12 @@ do_status() {
     printf " * Hostname: %s\n" "$CURRENT_HOSTNAME"
 
     # Get current public IP
-    IP=$(curl -s https://api64.ipify.org 2>/dev/null || curl -s https://ifconfig.me 2>/dev/null)
+    IP=$(curl -s --max-time 10 https://api64.ipify.org 2>/dev/null || \
+         curl -s --max-time 10 https://ifconfig.me 2>/dev/null || \
+         echo "unknown")
 
     # Check if Tor is active via check.torproject.org
-    HTML=$(curl -s "https://check.torproject.org/?lang=en_US" 2>/dev/null)
+    HTML=$(curl -s --max-time 15 "https://check.torproject.org/?lang=en_US" 2>/dev/null)
 
     if echo "$HTML" | grep -q "Congratulations. This browser is configured to use Tor."; then
         printf " * IP: %s\n" "$IP"
@@ -582,11 +784,18 @@ do_status() {
 
 do_update() {
     printf "\n[i] Updating...\n\n"
-    git clone https://github.com/MardoxTV/Kali-Anonymous
-    cd kali-anonymous || exit 1
-    sh setup.sh
-    cd ..
-    rm -rf kali-anonymous
+    check_root
+    TMP_DIR=$(mktemp -d) || { printf "[!] Failed to create temp dir\n"; exit 1; }
+    if ! git clone --depth=1 https://github.com/MardoxTV/Kali-Anonymous "$TMP_DIR/Kali-Anonymous"; then
+        printf "[!] git clone failed\n"
+        rm -rf "$TMP_DIR"
+        exit 1
+    fi
+    (
+        cd "$TMP_DIR/Kali-Anonymous" || exit 1
+        sh ./setup
+    ) || { printf "[!] setup failed\n"; rm -rf "$TMP_DIR"; exit 1; }
+    rm -rf "$TMP_DIR"
     printf "Updated!\n"
 }
 

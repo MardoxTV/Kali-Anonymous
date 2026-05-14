@@ -70,10 +70,30 @@ else
     printf "[+] net-tools is already installed.\n"
 fi
 
-# Ensure iproute2 is installed
-printf "[*] Ensuring iproute2 is installed...\n"
-apt-get install -y iproute2 || { printf "[!] Failed to install iproute2\n"; exit 1; }
-printf "[+] iproute2 OK.\n\n"
+# Ensure iproute2 is installed (provides ip, ss)
+if ! command -v ip >/dev/null 2>&1 || ! command -v ss >/dev/null 2>&1; then
+    printf "[*] iproute2 not found. Installing...\n"
+    apt-get install -y iproute2 || { printf "[!] Failed to install iproute2\n"; exit 1; }
+else
+    printf "[+] iproute2 is already installed.\n"
+fi
+
+# Ensure iptables is installed (still default on Kali, but be defensive)
+if ! command -v iptables >/dev/null 2>&1; then
+    printf "[*] iptables not found. Installing...\n"
+    apt-get install -y iptables || { printf "[!] Failed to install iptables\n"; exit 1; }
+else
+    printf "[+] iptables is already installed.\n"
+fi
+
+# Ensure procps (pkill/killall) is installed
+if ! command -v pkill >/dev/null 2>&1; then
+    printf "[*] procps not found. Installing...\n"
+    apt-get install -y procps psmisc || { printf "[!] Failed to install procps/psmisc\n"; exit 1; }
+else
+    printf "[+] procps is already installed.\n"
+fi
+
 
 # Check for e2fsprogs (needed for chattr command)
 if ! command -v chattr >/dev/null 2>&1; then
@@ -81,6 +101,28 @@ if ! command -v chattr >/dev/null 2>&1; then
     apt-get install -y e2fsprogs || { printf "[!] Failed to install e2fsprogs\n"; exit 1; }
 else
     printf "[+] e2fsprogs is already installed.\n"
+fi
+
+# Optional: virt-what (used to skip MAC change in VMs - non-fatal if absent)
+if ! command -v virt-what >/dev/null 2>&1; then
+    printf "[*] Installing virt-what (optional)...\n"
+    apt-get install -y virt-what || printf "[!] Could not install virt-what (non-fatal)\n"
+else
+    printf "[+] virt-what is already installed.\n"
+fi
+
+# Optional: bleachbit (used to wipe traces on stop - non-fatal if absent)
+if ! command -v bleachbit >/dev/null 2>&1; then
+    printf "[*] Installing bleachbit (optional)...\n"
+    apt-get install -y bleachbit || printf "[!] Could not install bleachbit (non-fatal)\n"
+else
+    printf "[+] bleachbit is already installed.\n"
+fi
+
+# Optional: wordlist for random hostnames - non-fatal if absent
+if [ ! -f /usr/share/dict/words ] && [ ! -f /etc/dictionaries-common/words ]; then
+    printf "[*] Installing wordlist for random hostnames (optional)...\n"
+    apt-get install -y wamerican || printf "[!] Could not install wordlist (non-fatal; falls back to numeric hostnames)\n"
 fi
 
 # Optionally install NetworkManager
@@ -116,9 +158,22 @@ printf "[+] Tor configuration updated.\n\n"
 
 # Enable and start Tor via systemd
 printf "[*] Enabling Tor service...\n"
+systemctl unmask tor 2>/dev/null
 systemctl enable tor 2>/dev/null || printf "[!] Could not enable tor service (non-fatal)\n"
 systemctl restart tor 2>/dev/null || { printf "[!] Failed to start tor\n"; exit 1; }
-printf "[+] Tor service running.\n\n"
+
+# Give Tor a moment to come up, then verify
+sleep 2
+if systemctl is-active --quiet tor; then
+    printf "[+] Tor service running.\n\n"
+else
+    printf "[!] Tor service is NOT active. Check 'systemctl status tor' / 'journalctl -u tor'\n"
+    printf "    Setup will continue, but 'anonymous start' will not work until Tor runs.\n\n"
+fi
+
+# Create runtime state directory used for backups during start/stop
+mkdir -p /var/lib/kali-anonymous
+chmod 700 /var/lib/kali-anonymous
 
 # Copy the main script
 printf "[*] Installing anonymous to /usr/sbin/anonymous...\n"
