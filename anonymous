@@ -446,8 +446,7 @@ enable_ipv6() {
     fi
 }
 
-# Wait for Tor to be ready: both the DNS and TransPort must be listening,
-# and Tor must have finished bootstrapping.
+# Wait for Tor's TransPort AND DNSPort to be listening
 wait_for_tor() {
     printf " * Waiting for Tor to initialize"
     COUNTER=0
@@ -463,18 +462,9 @@ wait_for_tor() {
 
         if echo "$PORTS" | grep -qE ":$TRANS_PORT([[:space:]]|$)" && \
            echo "$PORTS" | grep -qE ":53([[:space:]]|$)"; then
-            # Both ports are listening; check bootstrap status if possible
-            if command -v journalctl >/dev/null 2>&1 && \
-               journalctl -u tor -n 50 --no-pager 2>/dev/null | grep -q "Bootstrapped 100"; then
-                printf " (ready, bootstrapped)\n"
-                return 0
-            fi
-            # If we can't read the journal, accept "both ports listening" as ready
-            # after at least 3 seconds to give Tor time to bootstrap.
-            if [ "$COUNTER" -ge 3 ]; then
-                printf " (ready)\n"
-                return 0
-            fi
+            # Both ports are listening; Tor is ready
+            printf " (ready)\n"
+            return 0
         fi
 
         printf "."
@@ -482,8 +472,17 @@ wait_for_tor() {
         COUNTER=$((COUNTER + 1))
     done
 
-    printf " (timeout)\n"
-    printf "[!] Warning: Tor may not be fully initialized\n"
+    printf " (FAILED)\n"
+    printf "\n[!] ERROR: Tor is not listening on ports 9040 or 53 after 60 seconds.\n"
+    printf "[!] This usually means:\n"
+    printf "    1) Port 53 is in use by another process (systemd-resolved, dnsmasq, etc.)\n"
+    printf "    2) Tor failed to start due to configuration error\n"
+    printf "    3) Tor crashed shortly after starting\n\n"
+    printf "[*] Troubleshoot with:\n"
+    printf "    sudo ss -tuln | grep ':53'  # See what's using port 53\n"
+    printf "    sudo ss -tuln | grep ':9040'  # See what's using port 9040\n"
+    printf "    sudo systemctl status tor  # Check Tor status\n"
+    printf "    sudo journalctl -u tor -n 20  # See Tor errors\n\n"
     return 1
 }
 
@@ -502,9 +501,14 @@ configure_dns() {
         echo "inactive" > "$RESOLVED_STATE_FILE"
     fi
 
-    # Stop systemd-resolved and prevent it from coming back during the session
+    # Aggressively stop systemd-resolved and any other DNS services
     systemctl stop systemd-resolved 2>/dev/null
     systemctl mask systemd-resolved 2>/dev/null
+
+    # Kill any processes that might be listening on port 53
+    fuser -k 53/udp 2>/dev/null || true
+    fuser -k 53/tcp 2>/dev/null || true
+    sleep 1
 
     # Clear any immutable flag from a previous run, then remove the symlink/file
     chattr -i /etc/resolv.conf 2>/dev/null
@@ -523,7 +527,7 @@ DNSEOF
 
     # Test DNS via Tor with a few retries
     COUNTER=0
-    MAX_RETRIES=8
+    MAX_RETRIES=10
     while [ $COUNTER -lt $MAX_RETRIES ]; do
         printf "."
         if command -v dig >/dev/null 2>&1 && \
@@ -540,7 +544,8 @@ DNSEOF
         COUNTER=$((COUNTER + 1))
     done
 
-    printf " (not responding yet, continuing)\n"
+    printf " (not responding, may be port conflict)\n"
+    printf "[!] Warning: DNS not responding via Tor. Check 'ss -tuln | grep :53' for port conflicts.\n"
     return 1
 }
 
@@ -553,9 +558,16 @@ redirect_to_tor() {
         printf "[*] Starting Tor service...\n"
         systemctl unmask tor 2>/dev/null
         systemctl restart tor
-        wait_for_tor
+        if ! wait_for_tor; then
+            printf "[!] CRITICAL: Tor failed to start. Aborting anonymous mode setup.\n"
+            return 1
+        fi
     else
         printf "[*] Tor is already running\n"
+        if ! wait_for_tor; then
+            printf "[!] CRITICAL: Tor not listening on expected ports. Aborting.\n"
+            return 1
+        fi
     fi
 
     ensure_state_dir
