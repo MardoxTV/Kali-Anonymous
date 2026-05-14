@@ -267,7 +267,7 @@ change_hostname() {
 # Change the MAC address for a chosen network interface
 change_mac() {
     printf "Choose a network interface:\n"
-    printf "----------------------------\n"
+    printf '%s\n' "----------------------------"
     ls /sys/class/net
     read -p ">>> " macintosh
     printf "\n"
